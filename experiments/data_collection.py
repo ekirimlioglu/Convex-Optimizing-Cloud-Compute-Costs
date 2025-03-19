@@ -7,7 +7,7 @@ import time
 import json
 from datetime import datetime
 # Import the Azure parser
-from experiments.azure_parser import parse_azure_instance_data
+from azure_parser import parse_azure_instance_data
 
 # ----- DATA COLLECTION AND PREPARATION -----
 

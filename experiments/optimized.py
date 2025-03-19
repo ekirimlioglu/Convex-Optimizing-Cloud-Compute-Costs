@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import numpy as np
 import cvxpy as cp
 
@@ -209,3 +210,185 @@ def setup_optimization_problem(cloud_data, demand_vector, uncertainty_radius, ac
     # Create and return the problem
     problem = cp.Problem(cp.Minimize(objective), constraints)
     return problem, x, K, E, c, providers
+
+def convex_optimize_allocation(cloud_data, demand_vector, K, E, providers, existing_allocation=None, node_pools=None):
+    """
+    Optimized convex model for resource allocation
+    
+    This function uses convex optimization to find the most cost-effective
+    allocation of cloud instances to meet a given resource demand.
+    
+    Parameters:
+    cloud_data: DataFrame with instance information
+    demand_vector: Vector of resource demands [CPU, Memory, Network, Storage]
+    K: Resource matrix (resources × instances)
+    E: Provider matrix (providers × instances)
+    providers: List of provider names
+    existing_allocation: Optional existing allocation vector (for incremental allocation)
+    node_pools: Optional list of allowed node pools (provider_idx, instance_idx)
+    
+    Returns:
+    allocation: Vector of instance counts to allocate
+    """
+    # Get dimensions
+    m, n = K.shape  # m=resources, n=instances
+    p = len(providers)  # Number of providers
+    
+    # Extract cost vector
+    costs = cloud_data['cost'].values
+    
+    # Create optimization variables
+    # Note: We use integer variables for the instance counts
+    x = cp.Variable(n, integer=True)
+    
+    # Define objective: minimize total cost
+    objective = cp.Minimize(costs @ x)
+    
+    # Define constraints
+    constraints = [
+        # Non-negativity constraint (can't have negative instances)
+        x >= 0,
+        
+        # Resource demand constraints (must meet or exceed demand)
+        K @ x >= demand_vector
+    ]
+    
+    # Add existing allocation constraints if specified
+    if existing_allocation is not None:
+        # We can only add instances, not remove them
+        constraints.append(x >= existing_allocation)
+    
+    # Add node pool constraints if specified
+    if node_pools is not None:
+        # Create mask for allowed instances
+        allowed_mask = np.zeros(n, dtype=bool)
+        
+        for provider_idx, instance_idx in node_pools:
+            allowed_mask[instance_idx] = True
+        
+        # Add constraints to force non-allowed instances to zero
+        for i in range(n):
+            if not allowed_mask[i]:
+                constraints.append(x[i] == 0)
+    
+    # Define and solve the optimization problem
+    problem = cp.Problem(objective, constraints)
+    
+    # Try different solvers in order of preference
+    solvers = [cp.GLPK_MI, cp.SCIP, cp.CBC, cp.CPLEX]
+    solution_found = False
+    
+    for solver in solvers:
+        try:
+            problem.solve(solver=solver)
+            if problem.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
+                solution_found = True
+                print(f"Solved with solver: {solver}")
+                break
+        except (cp.SolverError, Exception) as e:
+            print(f"Solver {solver} failed: {str(e)}")
+            continue
+    
+    if not solution_found:
+        print("All integer solvers failed, trying OSQP...")
+        try:
+            # If all solvers failed, try with OSQP (continuous solver)
+            problem.solve(solver=cp.OSQP)
+            solution_found = problem.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]
+        except Exception as e:
+            print(f"OSQP failed: {str(e)}")
+    
+    if not solution_found:
+        print("Trying SCS as last resort...")
+        try:
+            # Last resort, try SCS
+            problem.solve(solver=cp.SCS)
+            solution_found = problem.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]
+        except Exception as e:
+            print(f"SCS failed: {str(e)}")
+    
+    if solution_found:
+        # Extract integer solution
+        allocation = np.round(x.value).astype(int)
+        
+        # Verify that the allocation meets the resource demands
+        resources_provided = K @ allocation
+        demand_satisfied = np.all(resources_provided >= demand_vector)
+        
+        if not demand_satisfied:
+            print("Warning: Rounded solution doesn't satisfy resource demands, adjusting...")
+            while not np.all(resources_provided >= demand_vector):
+                # Find the resource with the largest deficit
+                deficit = demand_vector - resources_provided
+                deficit[deficit < 0] = 0  # Only consider resources that are short
+                resource_idx = np.argmax(deficit)
+                
+                # Calculate efficiency (resource per cost) for valid instances
+                efficiencies = np.zeros(n)
+                for i in range(n):
+                    # Check if this instance is allowed
+                    allowed = True
+                    if node_pools is not None:
+                        allowed = False
+                        for p_idx, i_idx in node_pools:
+                            if i_idx == i:
+                                allowed = True
+                                break
+                    
+                    if allowed and costs[i] > 0:
+                        efficiencies[i] = K[resource_idx, i] / costs[i]
+                    else:
+                        efficiencies[i] = 0
+                
+                # Choose most efficient instance
+                instance_idx = np.argmax(efficiencies)
+                allocation[instance_idx] += 1
+                resources_provided = K @ allocation
+        
+        return allocation
+    else:
+        # If all solvers failed, try a greedy approach
+        print("All solvers failed, using greedy approach")
+        
+        # Start with existing allocation or zeros
+        if existing_allocation is not None:
+            allocation = existing_allocation.copy()
+        else:
+            allocation = np.zeros(n, dtype=int)
+        
+        # Calculate current resources
+        resources = K @ allocation
+        
+        # While any resource demand is not met
+        while not np.all(resources >= demand_vector):
+            # Find the resource with the largest deficit
+            deficit = demand_vector - resources
+            deficit[deficit < 0] = 0  # Only consider resources that are short
+            
+            if np.sum(deficit) == 0:
+                break
+                
+            # Find the resource that needs the most help
+            resource_idx = np.argmax(deficit)
+            
+            # Calculate efficiency (resource per cost) for valid instances
+            efficiencies = np.zeros(n)
+            for i in range(n):
+                # Check if this instance is allowed
+                allowed = True
+                if node_pools is not None:
+                    allowed = False
+                    for p_idx, i_idx in node_pools:
+                        if i_idx == i:
+                            allowed = True
+                            break
+                
+                if allowed and costs[i] > 0:
+                    efficiencies[i] = K[resource_idx, i] / costs[i]
+            
+            # Choose most efficient instance
+            instance_idx = np.argmax(efficiencies)
+            allocation[instance_idx] += 1
+            resources = K @ allocation
+        
+        return allocation

@@ -2,20 +2,14 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from non_optimized import (
-    greedy_allocation,
-    single_provider_allocation,
-    lowest_cost_provider_allocation,
-    multi_provider_allocation_cvxpy,
-    kubernetes_autoscaler_allocation,
-    kubernetes_resource_based_autoscaler
-)
+from non_optimized import kubernetes_autoscaler_allocation
+from optimized import convex_optimize_allocation  # Import optimized model
+from data_collection import prepare_cloud_data
+import os
 
 def load_cloud_instance_data():
     """
-    Generate sample cloud instance data for demo purposes
-    
-    In a real scenario, you would load this from a file or API
+    Load real cloud instance data from the data collection module
     
     Returns:
     cloud_data: DataFrame with instance information
@@ -24,49 +18,38 @@ def load_cloud_instance_data():
     providers: List of provider names
     resource_names: List of resource names
     """
-    # Define providers
-    providers = ["AWS", "GCP", "Azure"]
+    # Load real cloud provider data
+    print("Loading real cloud provider data...")
+    cloud_data = prepare_cloud_data()
     
-    # Define resource types
-    resource_names = ["CPU", "Memory", "GPU", "Network", "Storage"]
+    # Extract list of providers
+    providers = cloud_data['provider'].unique().tolist()
+    print(f"Found {len(providers)} providers: {providers}")
     
-    # Create instance data
-    instance_data = [
-        # Format: name, provider, cost, cpu, memory, gpu, network, storage
-        ("t2.micro", "AWS", 0.0116, 1, 1, 0, 1, 20),
-        ("t2.small", "AWS", 0.023, 1, 2, 0, 1, 20),
-        ("t2.medium", "AWS", 0.0464, 2, 4, 0, 1, 20),
-        ("t2.large", "AWS", 0.0928, 2, 8, 0, 2, 40),
-        ("m5.large", "AWS", 0.096, 2, 8, 0, 3, 40),
-        ("m5.xlarge", "AWS", 0.192, 4, 16, 0, 4, 80),
-        ("m5.2xlarge", "AWS", 0.384, 8, 32, 0, 5, 100),
-        ("g4dn.xlarge", "AWS", 0.526, 4, 16, 1, 5, 125),
-        
-        ("e2-micro", "GCP", 0.008, 0.5, 1, 0, 1, 10),
-        ("e2-small", "GCP", 0.017, 1, 2, 0, 1, 10),
-        ("e2-medium", "GCP", 0.034, 1, 4, 0, 2, 10),
-        ("e2-standard-2", "GCP", 0.067, 2, 8, 0, 2, 20),
-        ("e2-standard-4", "GCP", 0.134, 4, 16, 0, 3, 40),
-        ("n1-standard-4", "GCP", 0.19, 4, 15, 0, 4, 40),
-        ("n1-standard-8", "GCP", 0.38, 8, 30, 0, 5, 80),
-        ("n1-standard-16", "GCP", 0.76, 16, 60, 0, 6, 100),
-        ("a2-highgpu-1g", "GCP", 3.67, 12, 85, 1, 7, 200),
-        
-        ("B1s", "Azure", 0.0124, 1, 1, 0, 1, 4),
-        ("B1ms", "Azure", 0.0248, 1, 2, 0, 1, 4),
-        ("B2s", "Azure", 0.0496, 2, 4, 0, 2, 8),
-        ("B2ms", "Azure", 0.0992, 2, 8, 0, 2, 16),
-        ("D2s_v3", "Azure", 0.11, 2, 8, 0, 2, 16),
-        ("D4s_v3", "Azure", 0.22, 4, 16, 0, 3, 32),
-        ("D8s_v3", "Azure", 0.44, 8, 32, 0, 4, 64),
-        ("NC6s_v3", "Azure", 3.06, 6, 112, 1, 6, 336)
-    ]
+    # Add missing resource columns
+    if 'Network' not in cloud_data.columns:
+        # Estimate network capacity based on instance size
+        cloud_data['Network'] = (cloud_data['vcpu'] / 2).apply(np.ceil)
     
-    # Create DataFrame
-    cloud_data = pd.DataFrame(
-        instance_data, 
-        columns=["name", "provider", "cost", "CPU", "Memory", "GPU", "Network", "Storage"]
-    )
+    # Normalize column names - ensure consistency
+    column_mapping = {
+        'vcpu': 'CPU',
+        'memory': 'Memory',
+        'storage': 'Storage'
+    }
+    
+    for old_name, new_name in column_mapping.items():
+        if old_name in cloud_data.columns and new_name not in cloud_data.columns:
+            cloud_data[new_name] = cloud_data[old_name]
+    
+    # Define resource types to use in our model (removing GPU)
+    resource_names = ["CPU", "Memory", "Network", "Storage"]
+    
+    # Validate that all required resources exist in the data
+    for resource in resource_names:
+        if resource not in cloud_data.columns:
+            print(f"Warning: Resource '{resource}' not found in data, adding as zeros")
+            cloud_data[resource] = 0
     
     # Create resource matrix K
     m = len(resource_names)  # Number of resources
@@ -83,181 +66,619 @@ def load_cloud_instance_data():
     for i, provider in enumerate(providers):
         E[i, :] = (cloud_data["provider"] == provider).astype(int)
     
+    # Print some statistics about the data
+    print(f"Loaded {n} instance types across {p} providers")
+    print(f"Resource dimensions: {m} ({', '.join(resource_names)})")
+    
     return cloud_data, K, E, providers, resource_names
 
-def compare_allocations(cloud_data, demand_vector, K, E, providers, resource_names):
+def get_instance_index(cloud_data, instance_name, provider=None):
     """
-    Compare different allocation strategies
+    Get the index of an instance by name
+    
+    Parameters:
+    cloud_data: DataFrame with instance data
+    instance_name: Name of the instance to find
+    provider: Optional provider name to disambiguate
+    
+    Returns:
+    Index of the instance (or -1 if not found)
+    """
+    if provider:
+        mask = (cloud_data['name'] == instance_name) & (cloud_data['provider'] == provider)
+    else:
+        mask = cloud_data['name'] == instance_name
+    
+    if not mask.any():
+        print(f"Warning: Instance {instance_name} not found")
+        return -1
+    
+    return cloud_data[mask].index[0]
+
+def create_node_pools(cloud_data, providers, pool_configs):
+    """
+    Create node pools based on configuration
+    
+    Parameters:
+    cloud_data: DataFrame with instance data
+    providers: List of provider names
+    pool_configs: List of tuples (provider_name, instance_name)
+    
+    Returns:
+    node_pools: List of (provider_idx, instance_idx) tuples
+    """
+    node_pools = []
+    for provider_name, instance_name in pool_configs:
+        provider_idx = providers.index(provider_name) if provider_name in providers else -1
+        if provider_idx == -1:
+            print(f"Warning: Provider {provider_name} not found, skipping node pool")
+            continue
+            
+        instance_idx = get_instance_index(cloud_data, instance_name, provider_name)
+        if instance_idx == -1:
+            continue
+            
+        node_pools.append((provider_idx, instance_idx))
+    
+    return node_pools
+
+def create_existing_allocation(cloud_data, allocation_config):
+    """
+    Create existing allocation vector
+    
+    Parameters:
+    cloud_data: DataFrame with instance data
+    allocation_config: Dict mapping (provider, instance_name) to counts
+    
+    Returns:
+    existing_allocation: Vector of current instance counts
+    """
+    existing_allocation = np.zeros(len(cloud_data), dtype=int)
+    
+    for (provider, instance_name), count in allocation_config.items():
+        idx = get_instance_index(cloud_data, instance_name, provider)
+        if idx != -1:
+            existing_allocation[idx] = count
+    
+    return existing_allocation
+
+def run_allocation_comparison(cloud_data, K, E, providers, resource_names, 
+                             demand_vector, scenario_name, existing_allocation=None, 
+                             node_pools=None, description=None):
+    """
+    Run a comparison between non-optimized Kubernetes autoscaler and optimized convex allocation
     
     Parameters:
     cloud_data: DataFrame with instance information
-    demand_vector: Vector of resource demands
     K: Resource matrix
     E: Provider matrix
     providers: List of provider names
     resource_names: List of resource names
-    """
-    print(f"\nDemand vector: {dict(zip(resource_names, demand_vector))}")
+    demand_vector: Vector of resource demands
+    scenario_name: Name of the scenario for display
+    existing_allocation: Optional existing allocation vector
+    node_pools: Optional list of allowed node pools
+    description: Optional scenario description
     
-    # Define allocation strategies
-    strategies = {
-        "Greedy": lambda: greedy_allocation(cloud_data, demand_vector, K),
-        "Lowest Cost Provider": lambda: lowest_cost_provider_allocation(cloud_data, demand_vector, K, E, providers),
-        "Multi-provider Optimal": lambda: multi_provider_allocation_cvxpy(cloud_data, demand_vector, K, E, providers),
-        "Kubernetes CA (CPU-focused)": lambda: kubernetes_resource_based_autoscaler(
-            cloud_data, demand_vector, K, E, providers, resource_idx=0
-        ),
-        "Kubernetes CA (Memory-focused)": lambda: kubernetes_resource_based_autoscaler(
-            cloud_data, demand_vector, K, E, providers, resource_idx=1
-        ),
-        "Kubernetes Node Pool CA": lambda: kubernetes_autoscaler_allocation(
-            cloud_data, demand_vector, K, E, providers
-        )
+    Returns:
+    Dictionary containing results from both methods
+    """
+    print("\n" + "="*80)
+    print(f"SCENARIO: {scenario_name}")
+    print("="*80)
+    
+    if description:
+        print(f"\n{description}\n")
+    
+    # Print demand vector
+    print("Resource demands:")
+    for i, resource in enumerate(resource_names):
+        print(f"  {resource}: {demand_vector[i]}")
+    
+    # Print existing allocation if available
+    if existing_allocation is not None:
+        current_resources = K @ existing_allocation
+        total_existing_cost = np.sum(existing_allocation * cloud_data['cost'].values)
+        
+        print("\nExisting allocation:")
+        for i in range(len(existing_allocation)):
+            if existing_allocation[i] > 0:
+                print(f"  {existing_allocation[i]} × {cloud_data.iloc[i]['name']} ({cloud_data.iloc[i]['provider']}, ${cloud_data.iloc[i]['cost']}/hr)")
+        
+        print("\nExisting resources:")
+        for i, resource in enumerate(resource_names):
+            print(f"  {resource}: {current_resources[i]}")
+        
+        print(f"\nExisting cost: ${total_existing_cost:.4f}/hr")
+    
+    # Print node pools if available
+    if node_pools is not None:
+        print("\nAvailable node pools:")
+        for provider_idx, instance_idx in node_pools:
+            provider_name = providers[provider_idx]
+            instance_name = cloud_data.iloc[instance_idx]['name']
+            cost = cloud_data.iloc[instance_idx]['cost']
+            print(f"  {provider_name}: {instance_name} (${cost:.4f}/hr)")
+    
+    # Initialize results dictionary
+    results = {
+        'scenario_name': scenario_name,
+        'demand': demand_vector,
+        'providers': providers,
+        'resource_names': resource_names,
+        'cloud_data': cloud_data
     }
     
-    results = {}
+    # Run NON-OPTIMIZED Kubernetes Cluster Autoscaler
+    print("\n----- NON-OPTIMIZED: Kubernetes Cluster Autoscaler -----")
     
-    # Run each strategy
-    for name, strategy_func in strategies.items():
-        print(f"\nRunning {name} strategy...")
-        allocation = strategy_func()
-        
-        # Calculate resources and cost
-        resources = K @ allocation
-        cost = np.sum(allocation * cloud_data['cost'].values)
-        
-        # Print summary
-        print(f"Total cost: ${cost:.2f}")
-        print("Resources provided:")
-        for i, resource in enumerate(resource_names):
-            print(f"  {resource}: {resources[i]} (demanded: {demand_vector[i]})")
-        
-        # Print allocation
-        print("Instances allocated:")
-        for i in range(len(allocation)):
-            if allocation[i] > 0:
-                print(f"  {allocation[i]} × {cloud_data.iloc[i]['name']} (${cloud_data.iloc[i]['cost']}/hr)")
-        
-        results[name] = {
-            'allocation': allocation,
-            'resources': resources,
-            'cost': cost
-        }
+    k8s_allocation = kubernetes_autoscaler_allocation(
+        cloud_data, demand_vector, K, E, providers, 
+        existing_allocation=existing_allocation, 
+        node_pools=node_pools
+    )
     
+    # Calculate resources and cost for Kubernetes approach
+    k8s_resources = K @ k8s_allocation
+    k8s_cost = np.sum(k8s_allocation * cloud_data['cost'].values)
+    
+    # Print Kubernetes results
+    print("\nKubernetes AutoScaler allocation:")
+    for i in range(len(k8s_allocation)):
+        if k8s_allocation[i] > 0:
+            instance = cloud_data.iloc[i]
+            print(f"  {k8s_allocation[i]} × {instance['name']} ({instance['provider']}, ${instance['cost']:.4f}/hr)")
+    
+    print("\nResources provided by Kubernetes AutoScaler:")
+    for i, resource in enumerate(resource_names):
+        satisfaction = "✓" if k8s_resources[i] >= demand_vector[i] else "✗"
+        print(f"  {resource}: {k8s_resources[i]} (demanded: {demand_vector[i]}) {satisfaction}")
+    
+    print(f"\nKubernetes AutoScaler cost: ${k8s_cost:.4f}/hr")
+    
+    # Store Kubernetes results
+    results['kubernetes'] = {
+        'allocation': k8s_allocation,
+        'resources': k8s_resources,
+        'cost': k8s_cost,
+        'satisfied': np.all(k8s_resources >= demand_vector)
+    }
+    
+    # Run OPTIMIZED convex optimization allocation
+    print("\n----- OPTIMIZED: Convex Optimization Model -----")
+    
+    # Call the optimized allocation function
+    optimal_allocation = convex_optimize_allocation(
+        cloud_data, demand_vector, K, E, providers
+    )
+    
+    # Calculate resources and cost for optimal approach
+    optimal_resources = K @ optimal_allocation
+    optimal_cost = np.sum(optimal_allocation * cloud_data['cost'].values)
+    
+    # Print optimal results
+    print("\nOptimal allocation:")
+    for i in range(len(optimal_allocation)):
+        if optimal_allocation[i] > 0:
+            instance = cloud_data.iloc[i]
+            print(f"  {optimal_allocation[i]} × {instance['name']} ({instance['provider']}, ${instance['cost']:.4f}/hr)")
+    
+    print("\nResources provided by optimal allocation:")
+    for i, resource in enumerate(resource_names):
+        satisfaction = "✓" if optimal_resources[i] >= demand_vector[i] else "✗"
+        print(f"  {resource}: {optimal_resources[i]} (demanded: {demand_vector[i]}) {satisfaction}")
+    
+    print(f"\nOptimal allocation cost: ${optimal_cost:.4f}/hr")
+    
+    # Calculate cost difference
+    cost_diff = k8s_cost - optimal_cost
+    percent_diff = (cost_diff / optimal_cost * 100) if optimal_cost > 0 else 0
+    print(f"\nCost comparison: Kubernetes is ${cost_diff:.4f}/hr ({percent_diff:.2f}%) more expensive than optimal")
+    
+    # Store optimal results
+    results['optimal'] = {
+        'allocation': optimal_allocation,
+        'resources': optimal_resources,
+        'cost': optimal_cost,
+        'satisfied': np.all(optimal_resources >= demand_vector)
+    }
+    
+    # Return all results for visualization
     return results
 
-def plot_cost_comparison(results):
-    """Plot cost comparison between different strategies"""
-    strategies = list(results.keys())
-    costs = [results[s]['cost'] for s in strategies]
-    
-    plt.figure(figsize=(12, 6))
-    bar_plot = plt.bar(strategies, costs)
-    
-    # Add cost values on top of bars
-    for bar, cost in zip(bar_plot, costs):
-        plt.text(
-            bar.get_x() + bar.get_width()/2,
-            bar.get_height() + 0.05,
-            f'${cost:.2f}',
-            ha='center',
-            fontweight='bold'
-        )
-    
-    plt.title('Cost Comparison of Different Allocation Strategies')
-    plt.ylabel('Hourly Cost ($)')
-    plt.xticks(rotation=45, ha='right')
-    plt.tight_layout()
-    plt.savefig('cost_comparison.png')
-    plt.close()
-    
-    print("\nCost comparison plot saved as 'cost_comparison.png'")
-
-def plot_resource_efficiency(results, demand_vector, resource_names):
-    """Plot resource efficiency (resource provided / resource demanded)"""
-    strategies = list(results.keys())
-    resources = np.array([results[s]['resources'] for s in strategies])
-    
-    # Calculate efficiency (resources provided / resources demanded)
-    efficiency = resources / demand_vector
-    
-    # Plot
-    plt.figure(figsize=(14, 8))
-    
-    bar_width = 0.15
-    x = np.arange(len(resource_names))
-    
-    for i, strategy in enumerate(strategies):
-        plt.bar(
-            x + i*bar_width - (len(strategies)-1)*bar_width/2,
-            efficiency[i],
-            width=bar_width,
-            label=strategy
-        )
-    
-    plt.axhline(y=1.0, color='r', linestyle='--', label='Exact demand')
-    plt.xlabel('Resource Type')
-    plt.ylabel('Resource Efficiency (Provided/Demanded)')
-    plt.title('Resource Efficiency Comparison')
-    plt.xticks(x, resource_names)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig('resource_efficiency.png')
-    plt.close()
-    
-    print("Resource efficiency plot saved as 'resource_efficiency.png'")
-
 def main():
-    """Main function to run the experiments"""
-    print("Loading cloud instance data...")
+    """
+    Main function to compare Kubernetes autoscaler with optimized convex allocation
+    
+    This function:
+    1. Loads real cloud instance data from data_collection module
+    2. Creates several realistic scenarios for resource allocation
+    3. Compares non-optimized kubernetes_autoscaler_allocation with optimized convex allocation
+    4. Analyzes and visualizes the results
+    """
+    # Create output directory for results if it doesn't exist
+    os.makedirs('results', exist_ok=True)
+    
+    # Load real cloud instance data
     cloud_data, K, E, providers, resource_names = load_cloud_instance_data()
     
-    print("\nCloud providers:", providers)
-    print("Resource types:", resource_names)
-    print(f"Instance types: {len(cloud_data)} total across all providers")
+    if cloud_data is None or len(cloud_data) == 0:
+        raise Exception("Failed to load cloud provider data from data_collection module")
     
-    # Define a workload with diverse resource requirements
-    # This example has high CPU, memory and network demands, but also requires some GPU
+    # Dictionary to store results from all scenarios
+    results = {}
+    
+    # =====================================================================
+    # Scenario 1: Basic Web Application (No Existing Infrastructure)
+    # =====================================================================
     demand_vector = np.array([
-        32,    # CPU cores
-        64,    # GB Memory
-        2,     # GPUs
-        10,    # Network units
-        200    # GB Storage
-    ])
-    
-    # Compare allocation strategies
-    results = compare_allocations(cloud_data, demand_vector, K, E, providers, resource_names)
-    
-    # Plot results
-    plot_cost_comparison(results)
-    plot_resource_efficiency(results, demand_vector, resource_names)
-    
-    # Try a different workload - more balanced
-    print("\n\n=========================================")
-    print("Testing with a more balanced workload")
-    demand_vector = np.array([
-        16,    # CPU cores
-        32,    # GB Memory
-        0,     # GPUs
-        8,     # Network units
+        8,     # CPU cores
+        16,    # GB Memory
+        4,     # Network units
         100    # GB Storage
     ])
     
-    results = compare_allocations(cloud_data, demand_vector, K, E, providers, resource_names)
+    results['scenario1'] = run_allocation_comparison(
+        cloud_data, K, E, providers, resource_names,
+        demand_vector,
+        "New Web Application Deployment",
+        description="A new web application deployment with no existing infrastructure, allowing the autoscaler to choose optimal instances."
+    )
     
-    # Try a GPU-heavy workload
-    print("\n\n=========================================")
-    print("Testing with a GPU-heavy workload")
+    # =====================================================================
+    # Scenario 2: Scaling Up with Existing Infrastructure
+    # =====================================================================
+    # Get the most common providers from our data
+    available_providers = cloud_data['provider'].unique()
+    
+    # Create an existing allocation with small instances
+    existing_allocation_config = {}
+    
+    # Select small instances from available providers for our existing allocation
+    for provider in available_providers[:2]:  # Use up to 2 providers
+        provider_instances = cloud_data[cloud_data['provider'] == provider]
+        
+        # Find small instances (2-4 CPU cores)
+        small_instances = provider_instances[
+            (provider_instances['CPU'] >= 2) & 
+            (provider_instances['CPU'] <= 4)
+        ]
+        
+        if len(small_instances) > 0:
+            # Get the first suitable instance
+            instance = small_instances.iloc[0]
+            # Add 1-2 instances to our existing allocation
+            count = min(2, len(small_instances))
+            existing_allocation_config[(provider, instance['name'])] = count
+    
+    existing_allocation = create_existing_allocation(cloud_data, existing_allocation_config)
+    
+    # Higher demand for a growing application
     demand_vector = np.array([
-        8,     # CPU cores
+        16,    # CPU cores
         32,    # GB Memory
-        3,     # GPUs
-        5,     # Network units
-        50     # GB Storage
+        8,     # Network units
+        200    # GB Storage
     ])
     
-    results = compare_allocations(cloud_data, demand_vector, K, E, providers, resource_names)
+    results['scenario2'] = run_allocation_comparison(
+        cloud_data, K, E, providers, resource_names,
+        demand_vector,
+        "Scaling Up Existing Web Application",
+        existing_allocation=existing_allocation,
+        description="Traffic has increased and the existing web application needs more resources. The autoscaler will add to the existing instances."
+    )
+    
+    # =====================================================================
+    # Scenario 3: Enterprise Environment with Fixed Node Pools
+    # =====================================================================
+    node_pool_configs = []
+    
+    # Create enterprise node pools with a mix of instance types from available providers
+    for provider in available_providers[:3]:  # Use up to 3 providers
+        provider_instances = cloud_data[cloud_data['provider'] == provider]
+        
+        # Add small instances (2-4 cores)
+        small_instances = provider_instances[
+            (provider_instances['CPU'] >= 2) & 
+            (provider_instances['CPU'] <= 4)
+        ].head(2)  # Take up to 2 small instance types
+        
+        # Add medium instances (4-8 cores)
+        medium_instances = provider_instances[
+            (provider_instances['CPU'] > 4) & 
+            (provider_instances['CPU'] <= 8)
+        ].head(2)  # Take up to 2 medium instance types
+        
+        # Add large instances (8+ cores)
+        large_instances = provider_instances[
+            provider_instances['CPU'] > 8
+        ].head(1)  # Take up to 1 large instance type
+        
+        # Add instances to node pools
+        for instances in [small_instances, medium_instances, large_instances]:
+            for _, instance in instances.iterrows():
+                node_pool_configs.append((provider, instance['name']))
+    
+    # Create the node pools
+    node_pools = create_node_pools(cloud_data, providers, node_pool_configs)
+    
+    # Higher demand for an enterprise application
+    demand_vector = np.array([
+        24,    # CPU cores
+        64,    # GB Memory
+        12,    # Network units
+        300    # GB Storage
+    ])
+    
+    results['scenario3'] = run_allocation_comparison(
+        cloud_data, K, E, providers, resource_names,
+        demand_vector,
+        "Enterprise Environment with Fixed Node Pools",
+        node_pools=node_pools,
+        description="An enterprise environment with predefined node pool constraints, demonstrating how autoscalers are limited to specific instance types."
+    )
+    
+    # =====================================================================
+    # Scenario 4: Memory-Intensive Data Processing Workload
+    # =====================================================================
+    node_pool_configs = []
+    
+    # Create node pools with high-memory instances
+    for provider in available_providers[:3]:  # Use up to 3 providers
+        provider_instances = cloud_data[cloud_data['provider'] == provider]
+        
+        # Find high-memory instances (memory >= 16GB)
+        high_mem_instances = provider_instances[
+            provider_instances['Memory'] >= 16
+        ].head(3)  # Take up to 3 high-memory instances
+        
+        # Add to node pools
+        for _, instance in high_mem_instances.iterrows():
+            node_pool_configs.append((provider, instance['name']))
+    
+    # Create the node pools
+    node_pools = create_node_pools(cloud_data, providers, node_pool_configs)
+    
+    # Create an existing allocation with some high-memory instances
+    existing_allocation_config = {}
+    
+    # Add one high-memory instance from each provider to existing allocation
+    for provider in available_providers[:2]:  # Use up to 2 providers
+        provider_instances = cloud_data[cloud_data['provider'] == provider]
+        high_mem_instances = provider_instances[provider_instances['Memory'] >= 16]
+        
+        if len(high_mem_instances) > 0:
+            instance = high_mem_instances.iloc[0]
+            existing_allocation_config[(provider, instance['name'])] = 1
+    
+    existing_allocation = create_existing_allocation(cloud_data, existing_allocation_config)
+    
+    # Very high memory demand
+    demand_vector = np.array([
+        32,    # CPU cores
+        128,   # GB Memory
+        12,    # Network units
+        500    # GB Storage
+    ])
+    
+    results['scenario4'] = run_allocation_comparison(
+        cloud_data, K, E, providers, resource_names,
+        demand_vector,
+        "Data Processing Workload with High Memory Requirements",
+        existing_allocation=existing_allocation,
+        node_pools=node_pools,
+        description="A memory-intensive data processing workload requiring significant memory resources. Shows how the autoscaler handles specialized workloads."
+    )
+    
+    # =====================================================================
+    # Scenario 5: Resource Constraints with Limited Node Pools
+    # =====================================================================
+    node_pool_configs = []
+    
+    # Create very limited node pools with only small instances
+    for provider in available_providers[:3]:  # Use up to 3 providers
+        provider_instances = cloud_data[cloud_data['provider'] == provider]
+        
+        # Find only small instances (CPU <= 2)
+        small_instances = provider_instances[
+            provider_instances['CPU'] <= 2
+        ].head(2)  # Take up to 2 small instances
+        
+        # Add to node pools
+        for _, instance in small_instances.iterrows():
+            node_pool_configs.append((provider, instance['name']))
+    
+    # Create the node pools
+    node_pools = create_node_pools(cloud_data, providers, node_pool_configs)
+    
+    # High resource demands that will be challenging with the limited pools
+    demand_vector = np.array([
+        32,    # CPU cores
+        64,    # GB Memory
+        12,    # Network units
+        300    # GB Storage
+    ])
+    
+    results['scenario5'] = run_allocation_comparison(
+        cloud_data, K, E, providers, resource_names,
+        demand_vector,
+        "Resource-Intensive Workload with Limited Node Pools",
+        node_pools=node_pools,
+        description="A resource-intensive workload with limited node pool options, demonstrating the limitations of fixed node pools in Kubernetes environments."
+    )
+    
+    # =====================================================================
+    # Summary and Visualizations
+    # =====================================================================
+    print("\n" + "="*80)
+    print("SUMMARY OF ALL SCENARIOS")
+    print("="*80)
+    
+    # Extract comparison metrics
+    scenario_names = []
+    k8s_costs = []
+    optimal_costs = []
+    savings = []
+    
+    for name, result in results.items():
+        if 'kubernetes' in result and 'optimal' in result:
+            scenario_names.append(name)
+            k8s_cost = result['kubernetes']['cost']
+            optimal_cost = result['optimal']['cost']
+            saving = k8s_cost - optimal_cost
+            
+            k8s_costs.append(k8s_cost)
+            optimal_costs.append(optimal_cost)
+            savings.append(saving)
+            
+            # Print summary
+            print(f"\n{name}:")
+            print(f"  Kubernetes Cost: ${k8s_cost:.4f}/hr")
+            print(f"  Optimal Cost: ${optimal_cost:.4f}/hr")
+            print(f"  Potential Saving: ${saving:.4f}/hr ({saving/k8s_cost*100:.2f}%)")
+    
+    # Import visualization functions from visualize.py
+    from visualize import plot_k8s_costs, plot_k8s_resource_utilization, plot_k8s_instance_count
+    
+    # Generate and save visualizations
+    # Cost comparison visualization - using separate axes with different scales
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6), gridspec_kw={'width_ratios': [1, 3]})
+    x = np.arange(len(scenario_names))
+    width = 0.7
+    
+    # Left plot: Kubernetes costs (small scale)
+    bars1 = ax1.bar(x, k8s_costs, width, label='Kubernetes AutoScaler')
+    ax1.set_ylabel('Kubernetes Cost ($)')
+    ax1.set_title('Kubernetes Costs')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(scenario_names)
+    
+    # Add cost labels
+    for i, v in enumerate(k8s_costs):
+        ax1.text(i, v + 0.01, f'${v:.4f}', ha='center', va='bottom', fontsize=9)
+    
+    # Right plot: Optimal costs (large scale)
+    bars2 = ax2.bar(x, optimal_costs, width, label='Convex Optimization', color='orange')
+    ax2.set_ylabel('Optimal Cost ($)')
+    ax2.set_title('Convex Optimization Costs')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(scenario_names)
+    
+    # Add cost labels
+    for i, v in enumerate(optimal_costs):
+        ax2.text(i, v * 0.95, f'${v:.2f}', ha='center', va='top', fontsize=9, color='white')
+    
+    plt.suptitle('Cost Comparison: Kubernetes vs. Convex Optimization (Different Scales)', fontsize=14)
+    plt.tight_layout()
+    plt.savefig('results/cost_comparison_separate_scales.png', dpi=300)
+    plt.close()
+    
+    # Create a log-scale comparison for both costs on the same chart
+    plt.figure(figsize=(12, 6))
+    
+    # Use log scale to show both values
+    bar_width = 0.35
+    plt.bar(x - bar_width/2, k8s_costs, bar_width, label='Kubernetes AutoScaler')
+    plt.bar(x + bar_width/2, optimal_costs, bar_width, label='Convex Optimization', color='orange')
+    
+    # Add cost labels
+    for i, v in enumerate(k8s_costs):
+        plt.text(i - bar_width/2, v * 1.1, f'${v:.4f}', ha='center', va='bottom', fontsize=9)
+    
+    for i, v in enumerate(optimal_costs):
+        plt.text(i + bar_width/2, v * 1.1, f'${v:.2f}', ha='center', va='bottom', fontsize=9)
+    
+    plt.ylabel('Cost ($) - Log Scale')
+    plt.xlabel('Scenario')
+    plt.title('Cost Comparison: Kubernetes vs. Convex Optimization (Log Scale)')
+    plt.xticks(x, scenario_names)
+    plt.yscale('log')  # Use log scale to handle the large differences
+    plt.legend()
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.savefig('results/cost_comparison_log_scale.png', dpi=300)
+    plt.close()
+    
+    # Resource utilization comparison with separate subplots for each resource
+    for scenario_name, result in results.items():
+        if 'kubernetes' in result and 'optimal' in result:
+            # Compare resource utilization
+            k8s_resources = result['kubernetes']['resources']
+            optimal_resources = result['optimal']['resources']
+            demand = result['demand']
+            
+            # Create a figure with one subplot per resource type
+            fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+            axs = axs.flatten()
+            
+            # Plot each resource in its own subplot
+            for i, resource in enumerate(resource_names):
+                ax = axs[i]
+                
+                # Data for this resource
+                k8s_val = k8s_resources[i]
+                opt_val = optimal_resources[i]
+                dem_val = demand[i]
+                
+                # Create bar chart
+                x_pos = np.array([0, 1, 2])
+                width = 0.6
+                ax.bar(x_pos, [k8s_val, opt_val, dem_val], width)
+                
+                # Add value labels
+                ax.text(0, k8s_val*1.05, f'{k8s_val:.1f}', ha='center')
+                ax.text(1, opt_val*1.05, f'{opt_val:.1f}', ha='center')
+                ax.text(2, dem_val*1.05, f'{dem_val:.1f}', ha='center')
+                
+                # Add labels
+                ax.set_title(f'{resource} Allocation')
+                ax.set_xticks(x_pos)
+                ax.set_xticklabels(['Kubernetes', 'Optimal', 'Demand'])
+                ax.grid(axis='y', linestyle='--', alpha=0.7)
+            
+            plt.suptitle(f'Resource Allocation Comparison - {scenario_name}', fontsize=16)
+            plt.tight_layout()
+            plt.savefig(f'results/{scenario_name}_resource_comparison_subplots.png', dpi=300)
+            plt.close()
+            
+            # Also create a normalized version to show relative proportions
+            fig, axs = plt.subplots(1, 1, figsize=(10, 6))
+            
+            # Normalize each resource by its demand
+            normalized_k8s = [k8s_resources[i]/demand[i] for i in range(len(resource_names))]
+            normalized_opt = [optimal_resources[i]/demand[i] for i in range(len(resource_names))]
+            
+            x = np.arange(len(resource_names))
+            width = 0.35
+            
+            # Plot normalized values
+            axs.bar(x - width/2, normalized_k8s, width, label='Kubernetes')
+            axs.bar(x + width/2, normalized_opt, width, label='Optimal')
+            
+            # Add horizontal line at y=1 (exactly meeting demand)
+            axs.axhline(y=1, color='r', linestyle='--', alpha=0.7, label='Demand')
+            
+            # Add percentage labels
+            for i, val in enumerate(normalized_k8s):
+                axs.text(i - width/2, val + 0.05, f'{val*100:.0f}%', ha='center', fontsize=9)
+            
+            for i, val in enumerate(normalized_opt):
+                axs.text(i + width/2, val + 0.05, f'{val*100:.0f}%', ha='center', fontsize=9)
+            
+            axs.set_ylabel('Resource Utilization (Relative to Demand)')
+            axs.set_xlabel('Resource Type')
+            axs.set_title(f'Resource Utilization Efficiency - {scenario_name}')
+            axs.set_xticks(x)
+            axs.set_xticklabels(resource_names)
+            axs.legend()
+            axs.grid(axis='y', linestyle='--', alpha=0.7)
+            plt.tight_layout()
+            plt.savefig(f'results/{scenario_name}_resource_utilization.png', dpi=300)
+            plt.close()
+    
+    print("\nVisualizations saved to 'results' directory")
+    print("\nComparison analysis complete!")
 
 if __name__ == "__main__":
     main()
