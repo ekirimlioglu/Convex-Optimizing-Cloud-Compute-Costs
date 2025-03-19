@@ -275,7 +275,7 @@ def convex_optimize_allocation(cloud_data, demand_vector, K, E, providers, exist
     problem = cp.Problem(objective, constraints)
     
     # Try different solvers in order of preference
-    solvers = [cp.GLPK_MI, cp.SCIP, cp.CBC, cp.CPLEX]
+    solvers = [cp.GLPK_MI, cp.SCIP, cp.CBC, cp.CPLEX, cp.GUROBI]
     solution_found = False
     
     for solver in solvers:
